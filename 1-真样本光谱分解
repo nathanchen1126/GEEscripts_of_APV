@@ -1,0 +1,105 @@
+// ============================================================
+// 0. 输入与影像准备
+// ============================================================
+
+var bands = ['B2', 'B3', 'B4', 'B8', 'B11', 'B12'];
+
+var s2Col = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+    .filterBounds(table)
+    .filterDate('2023-01-01', '2023-12-31')
+    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
+    .map(function(image){
+      return image.addBands(image.select(bands).divide(10000), null, true);
+    });
+
+var imageForUnmix = s2Col.median().select(bands);
+
+// ============================================================
+// 1. 端元定义
+// ============================================================
+
+var em_pv     = [0.08337, 0.08620, 0.08395, 0.12090, 0.24047, 0.14890];
+var em_agri   = [0.06740, 0.09295, 0.09643, 0.26468, 0.21735, 0.13560];
+var em_barren = [0.08447, 0.11285, 0.16155, 0.22142, 0.22857, 0.14270];
+var em_dark   = [0, 0, 0, 0, 0, 0];
+var em_bright = [0.06980, 0.08150, 0.11740, 0.17920, 0.20280, 0.18820];
+
+var endmembers = [em_pv, em_agri, em_barren, em_dark, em_bright];
+
+// ============================================================
+// 2. 光谱分解
+// ============================================================
+
+var fractions = imageForUnmix.unmix(endmembers, true, true)
+    .rename(['f_pv', 'f_agri', 'f_barren', 'f_dark', 'f_bright']);
+
+var meanFractions = fractions.reduceRegions({
+  collection: table,
+  reducer: ee.Reducer.mean(),
+  scale: 10,
+  tileScale: 4
+});
+
+
+// ============================================================
+// 3. 添加强度项 + 均衡项字段
+// ============================================================
+
+var eps = 1e-6;
+
+var withIndicators = meanFractions.map(function(feature) {
+  var pv = ee.Number(feature.get('f_pv'));
+  var agri = ee.Number(feature.get('f_agri'));
+  var barren = ee.Number(feature.get('f_barren'));
+  var dark = ee.Number(feature.get('f_dark'));
+  var bright = ee.Number(feature.get('f_bright'));
+
+  var total = pv.add(agri).add(barren).add(dark).add(bright);
+  var strength = pv.add(agri).divide(total.add(eps));
+  var balance = ee.Number(1).subtract(pv.subtract(agri).abs().divide(pv.add(agri).add(eps)));
+
+  return feature.set({
+    'strength': strength,
+    'balance': balance
+  });
+});
+
+// ============================================================
+// 4. 计算分位数阈值（前30%的下界 = 70%分位点）
+// ============================================================
+
+var strengthList = withIndicators.aggregate_array('strength');
+var balanceList = withIndicators.aggregate_array('balance');
+
+var strengthThreshold = strengthList.reduce(ee.Reducer.percentile([70]));
+var balanceThreshold = balanceList.reduce(ee.Reducer.percentile([70]));
+
+// ============================================================
+// 5. 多条件筛选（只保留符合条件的 polygon）
+// ============================================================
+
+var filtered = withIndicators.filter(ee.Filter.and(
+  ee.Filter.gte('strength', strengthThreshold),
+  ee.Filter.gte('balance', balanceThreshold),
+  ee.Filter.lte('f_barren', 0.1),
+  ee.Filter.lte('f_dark', 0.1),
+  ee.Filter.lte('f_bright', 0.1)
+));
+
+// ============================================================
+// 6. 输出与导出
+// ============================================================
+
+
+print('原始 polygon 数量：', withIndicators.size());
+print('筛选后 polygon 数量：', filtered.size());
+
+Map.centerObject(table, 10);
+Map.addLayer(filtered.style({color: 'red', fillColor: '00FF00'}), {}, '筛选后 Polygon');
+
+// ✅ 导出为 FeatureCollection 到 GEE Asset
+Export.table.toAsset({
+  collection: filtered,
+  description: 'APV_SMA_Filtered_hn',
+  assetId: 'projects/tiebian/assets/apv_train_hn'
+});
