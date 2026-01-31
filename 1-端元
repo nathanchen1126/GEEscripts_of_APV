@@ -1,0 +1,211 @@
+// ============================================================
+// 0. 你需要已定义：db, roi_pv, roi_agri, roi_barren, roi_bright
+//    且它们都是 FeatureCollection(点)
+// ============================================================
+// 1) Sentinel-2 SR 预处理：SCL 去云/云影 + 选指定波段
+// ============================================================
+
+function preprocessS2SR(image) {
+  var scl = image.select('SCL');
+
+  // SCL 分类：3=云影, 8/9=云, 10=卷云, 11=雪
+  var mask = scl.neq(3)
+    .and(scl.neq(8))
+    .and(scl.neq(9))
+    .and(scl.neq(10))
+    .and(scl.neq(11));
+
+  // 选择波段：B2, B3, B4, B8, B11, B12
+  // SR 缩放：/10000
+  var optical = image.select(['B2','B3','B4','B8','B11','B12']).divide(10000);
+
+  return optical.updateMask(mask)
+    .copyProperties(image, ['system:time_start']);
+}
+
+// 影像集合：用 db 筛选，确保覆盖 ROI
+var s2Img = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+  .filterBounds(db)
+  .filterDate('2023-01-01', '2023-12-31')
+  .filter(ee.Filter.lte('CLOUDY_PIXEL_PERCENTAGE', 60)) // 粗筛
+  .map(preprocessS2SR)
+  .median();
+
+// 注意：B11/B12 为 20m，后续采样与邻域统计用 20m 更一致
+var SCALE = 20;
+
+
+// ============================================================
+// 2) 合并所有 ROI 点，并打上 label（逐点）
+// ============================================================
+
+function addLabel(fc, label) {
+  return ee.FeatureCollection(fc).map(function(f) {
+    return f.set('label', label);
+  });
+}
+
+var allPts = ee.FeatureCollection([
+  addLabel(roi_pv, 'PV'),
+  addLabel(roi_agri, 'Agri'),
+  addLabel(roi_barren, 'Barren'),
+  addLabel(roi_bright, 'Bright')
+]).flatten();
+
+
+// ============================================================
+// 3) 临域筛选 + 纯度验证：用 3x3 邻域标准差衡量“纯度”
+//    思路：纯像元周围同质 -> 邻域 stdDev 小
+// ============================================================
+
+// 3x3 kernel（20m尺度下，约60m邻域）
+var kernel = ee.Kernel.square({radius: 1, units: 'pixels'});
+
+// 为每个波段计算邻域 stdDev，并拼成一个 std 栈
+var bands = ['B2','B3','B4','B8','B11','B12'];
+
+var stdStack = ee.Image.cat(bands.map(function(b) {
+  return s2Img.select(b).reduceNeighborhood({
+    reducer: ee.Reducer.stdDev(),
+    kernel: kernel
+  }).rename(b + '_std');
+}));
+
+// 将原始波段 + stdDev 一起采样到点上
+var sampleStack = s2Img.addBands(stdStack);
+
+// 在点上采样
+var ptSamples = sampleStack.sampleRegions({
+  collection: allPts,
+  scale: SCALE,
+  geometries: true
+});
+
+// 计算纯度分数：std 的均值（也可以用 max，更严格）
+var withPurity = ptSamples.map(function(f) {
+  var stdVals = ee.List(bands.map(function(b){ return ee.Number(f.get(b + '_std')); }));
+  var meanStd = ee.Number(stdVals.reduce(ee.Reducer.mean()));
+  var maxStd  = ee.Number(stdVals.reduce(ee.Reducer.max()));
+
+  // 纯度分数：meanStd（越小越纯）；你也可以改用 maxStd
+  return f.set({
+    'purity_meanStd': meanStd,
+    'purity_maxStd': maxStd
+  });
+});
+
+// 纯度阈值（默认给一个“通常可用”的起点）
+// 对 S2 SR(0-1)，3x3 邻域 std < 0.01 通常表示较同质。
+// 你可根据结果分布调整：例如 0.005 更严格，0.02 更宽松。
+var PURE_THR = 0.01;
+
+// 过滤不纯点（临域筛选后的“纯点集”）
+var purePts = withPurity.filter(ee.Filter.lt('purity_meanStd', PURE_THR));
+
+// （可选）打印每类剩余点数，看看是否筛太狠
+var countByLabel = purePts.reduceColumns({
+  reducer: ee.Reducer.count().group({groupField: 0, groupName: 'label'}),
+  selectors: ['label']
+});
+print('Counts after purity filter (by label):', countByLabel);
+
+
+// ============================================================
+// 4) 输出端元波段值：对“纯点集”按 label 计算各波段 median + 计数 n
+//    （稳健实现：逐波段 group median，再合并）
+// ============================================================
+
+var bands = ['B2','B3','B4','B8','B11','B12'];
+
+// ---- 4.0 先做一次“字段完整性”过滤：保证每个点都有6个波段值
+var purePtsClean = purePts.filter(
+  ee.Filter.and(
+    ee.Filter.notNull(['label']),
+    ee.Filter.notNull(bands)
+  )
+);
+
+// 如果你担心筛完后某类点太少，可以先打印数量
+print('Pure points (clean) count:', purePtsClean.size());
+
+// ---- 4.1 计算每类点数 n：count(B2) group by label
+var groupedCount = purePtsClean.reduceColumns({
+  reducer: ee.Reducer.count().group({groupField: 0, groupName: 'label'}),
+  selectors: ['label', 'B2']
+});
+
+var countDict = ee.Dictionary(
+  ee.List(groupedCount.get('groups')).iterate(function(item, acc) {
+    item = ee.Dictionary(item);
+    acc = ee.Dictionary(acc);
+    return acc.set(ee.String(item.get('label')), ee.Number(item.get('count')));
+  }, ee.Dictionary({}))
+);
+
+// ---- 4.2 对每个波段分别计算 median（分组）
+function bandMedianDict(bandName) {
+  var grouped = purePtsClean.reduceColumns({
+    reducer: ee.Reducer.median().group({groupField: 0, groupName: 'label'}),
+    selectors: ['label', bandName]
+  });
+
+  // 转成 {label: medianValue} 字典
+  return ee.Dictionary(
+    ee.List(grouped.get('groups')).iterate(function(item, acc) {
+      item = ee.Dictionary(item);
+      acc = ee.Dictionary(acc);
+      return acc.set(ee.String(item.get('label')), item.get('median'));
+    }, ee.Dictionary({}))
+  );
+}
+
+var b2Dict  = bandMedianDict('B2');
+var b3Dict  = bandMedianDict('B3');
+var b4Dict  = bandMedianDict('B4');
+var b8Dict  = bandMedianDict('B8');
+var b11Dict = bandMedianDict('B11');
+var b12Dict = bandMedianDict('B12');
+
+// ---- 4.3 生成最终端元表：每个 label 一行
+var labels = ee.List(countDict.keys()).sort();
+
+var endmemberFC = ee.FeatureCollection(
+  labels.map(function(lab) {
+    lab = ee.String(lab);
+    return ee.Feature(null, {
+      label: lab,
+      n: countDict.get(lab),
+      B2: b2Dict.get(lab),
+      B3: b3Dict.get(lab),
+      B4: b4Dict.get(lab),
+      B8: b8Dict.get(lab),
+      B11: b11Dict.get(lab),
+      B12: b12Dict.get(lab)
+    });
+  })
+);
+
+print('Endmember band values (median of PURE points):', endmemberFC);
+
+
+
+// ============================================================
+// 5) 导出：每个端元一行（label + n + 6个波段）
+// ============================================================
+
+Export.table.toDrive({
+  collection: endmemberFC,
+  description: 'S2_Endmembers_Median_From_PurePoints_2023',
+  fileFormat: 'CSV',
+  selectors: ['label','n','B2','B3','B4','B8','B11','B12']
+});
+
+
+// ============================================================
+// 6) 可视化
+// ============================================================
+
+Map.centerObject(db, 10);
+Map.addLayer(s2Img, {bands:['B4','B3','B2'], min:0, max:0.3}, 'S2 SR Median 2023 (masked)');
+Map.addLayer(allPts, {color: 'yellow'}, 'All ROI points');
+Map.addLayer(purePts, {color: 'red'}, 'Pure ROI points (after neighborhood filter)');
