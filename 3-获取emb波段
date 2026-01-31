@@ -1,0 +1,96 @@
+// ============================================================
+// step 1 ：特征筛选与 Asset 导出
+// ============================================================
+
+var PARAMS = {
+  seed: 1,
+  top_k_bands: 20,
+  export_asset_path: 'projects/tiebian/assets/APV_emb_hz' 
+};
+
+var roi = ee.FeatureCollection('users/nathanchen011126/climate_hz').geometry();
+var truePolysSource = ee.FeatureCollection('projects/tiebian/assets/apv_train_hz');
+var falsePointsSource = ee.FeatureCollection('projects/tiebian/assets/fake_nega_hz_balance');
+
+// 1. 加载全量 Embedding
+var embeddingRaw = ee.ImageCollection('GOOGLE/SATELLITE_EMBEDDING/V1/ANNUAL')
+  .filterDate('2023-01-01', '2024-01-01')
+  .filterBounds(roi)
+  .median();
+
+// --- 打印波段名称 ---
+var embedBandsRaw = embeddingRaw.bandNames();
+print('原始 Embedding 波段列表:', embedBandsRaw);
+print('波段总数:', embedBandsRaw.length());
+
+// ========================
+// 2. 快速采样 (修复：添加 class 属性)
+// ========================
+
+// 2.1 正样本：生成点并赋予 class = 1
+var truePoints = truePolysSource.map(function(poly){
+  return ee.FeatureCollection.randomPoints({
+    region: poly.geometry(), 
+    points: 5, // 仅用于筛选波段，少量点即可
+    seed: PARAMS.seed
+  }).map(function(f) {
+    return f.set('class', 1); // <--- 关键修复：添加标签
+  });
+}).flatten();
+
+// 2.2 负样本：取点并赋予 class = 0
+var falsePoints = falsePointsSource
+  .limit(500) // 限制数量，保持平衡即可
+  .map(function(f) {
+    return f.set('class', 0); // <--- 关键修复：添加标签
+  });
+
+// 2.3 合并
+var samplePoints = truePoints.merge(falsePoints);
+
+// 2.4 采样 (Feature Selection 只需要 100m 粗略采样即可，速度快)
+var subsetForSelection = embeddingRaw.sampleRegions({
+  collection: samplePoints,
+  properties: ['class'], // <--- 确保保留 class 属性
+  scale: 100, 
+  tileScale: 16,
+  geometries: false
+});
+
+// ========================
+// 3. 训练轻量 RF 评估重要性
+// ========================
+
+// 训练分类器
+var selectorRF = ee.Classifier.smileRandomForest(30)
+  .train(subsetForSelection, 'class', embedBandsRaw);
+
+// 计算重要性
+var importance = ee.Dictionary(selectorRF.explain().get('importance'));
+
+// 排序并取 Top K
+var topBands = ee.FeatureCollection(importance.keys().map(function(key){
+    return ee.Feature(null, {'band': key, 'score': importance.get(key)});
+  }))
+  .sort('score', false)
+  .limit(PARAMS.top_k_bands)
+  .aggregate_array('band');
+
+print('筛选出的 Top-20 最佳波段:', topBands);
+
+// ========================
+// 4. 导出筛选后的影像
+// ========================
+
+// 仅选择筛选出的波段
+var finalEmbedToExport = embeddingRaw.select(topBands).clip(roi);
+
+Export.image.toAsset({
+  image: finalEmbedToExport,
+  description: 'Export_TopK_Embedding',
+  assetId: PARAMS.export_asset_path,
+  region: roi,
+  scale: 30, // 导出为30m，方便后续计算
+  maxPixels: 1e13,
+  pyramidingPolicy: {'.default': 'mean'}
+});
