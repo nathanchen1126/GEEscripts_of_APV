@@ -1,0 +1,131 @@
+// ============================================================
+// 1. 基础设置与区域定义
+// ============================================================
+var roiGeometry = table.geometry(); // 确保你的变量名是 table
+Map.centerObject(roiGeometry, 13);
+
+// ============================================================
+// 2. 轻量去云 + 云影抑制（QA60 主掩膜 + SCL 仅剔除云影）
+// ============================================================
+function maskS2clouds(image) {
+  // --- 1) QA60：去云/卷云（主方案）---
+  var qa = image.select('QA60');
+  var cloudBitMask  = 1 << 10;  // clouds
+  var cirrusBitMask = 1 << 11;  // cirrus
+
+  var qaMask = qa.bitwiseAnd(cloudBitMask).eq(0)
+    .and(qa.bitwiseAnd(cirrusBitMask).eq(0));
+
+  // --- 2) SCL：轻量云影抑制（只去掉 3=Cloud Shadow）---
+  // 注意：不去 8/9/10/11，不去 2/5，避免误伤光伏/暗像元/非植被
+  var scl = image.select('SCL');
+  var shadowMask = scl.neq(3);
+
+  // --- 3) 合并掩膜 ---
+  var mask = qaMask.and(shadowMask);
+
+  return image.updateMask(mask)
+    .divide(10000)
+    .copyProperties(image, ['system:time_start']);
+}
+
+// 添加 NDVI 波段函数
+function addNDVI(image) {
+  var ndvi = image.normalizedDifference(['B8', 'B4']).rename('NDVI');
+  return image.addBands(ndvi);
+}
+
+// ============================================================
+// 3. 构建 Sentinel-2 年合成影像 (优化版：移除 If)
+// ============================================================
+var startYear = 2017;
+var endYear = 2023;
+var years = ee.List.sequence(startYear, endYear);
+
+// 提前定义基础集合，减少循环内的重复定义开销
+var s2_base = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED') 
+    .filterBounds(roiGeometry) 
+    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20));
+
+var yearlyImages = years.map(function(y) {
+  var year = ee.Number(y);
+  var start = ee.Date.fromYMD(year, 1, 1);
+  var end = ee.Date.fromYMD(year, 12, 31);
+  
+  // 筛选当年的影像
+  var s2_year = s2_base
+    .filterDate(start, end)
+    .map(maskS2clouds)
+    .map(addNDVI);
+    
+  // --- [关键修改点] ---
+  // 1. 移除 ee.Algorithms.If()
+  // 2. 移除 s2.size() 的计算（非常耗时）
+  // 3. 直接计算中值。如果当年无影像，result 将是一个无波段的图像。
+  return s2_year.median()
+    .select(['NDVI']) // 明确只选 NDVI
+    .set('year', year)
+    .set('system:time_start', start.millis());
+});
+
+// 将 List 转为 Collection
+var timeSeriesColRaw = ee.ImageCollection.fromImages(yearlyImages);
+
+// --- [关键修改点] ---
+// 使用过滤器剔除无效年份（即那些没有 NDVI 波段的年份）
+// 这完全替代了之前的 If(size > 0) 逻辑，而且速度极快。
+var timeSeriesCol = timeSeriesColRaw
+    .filter(ee.Filter.listContains('system:band_names', 'NDVI'));
+
+// 打印一下，检查是否有的年份被过滤掉了（通常东北地区应该7年全在）
+print('Valid Years Found:', timeSeriesCol.size());
+
+// ============================================================
+// 4. 计算时序特征 (保持不变)
+// ============================================================
+var ndviSD = timeSeriesCol.reduce(ee.Reducer.stdDev()).rename('NDVI_sd');
+var ndviMean = timeSeriesCol.reduce(ee.Reducer.mean()).rename('NDVI_mean');
+var ndviMin = timeSeriesCol.reduce(ee.Reducer.min()).rename('NDVI_min');
+
+
+// ============================================================
+// 4. 计算时序特征
+// ============================================================
+var ndviSD = timeSeriesCol.reduce(ee.Reducer.stdDev()).rename('NDVI_sd');
+var ndviMean = timeSeriesCol.reduce(ee.Reducer.mean()).rename('NDVI_mean');
+var ndviMin = timeSeriesCol.reduce(ee.Reducer.min()).rename('NDVI_min');
+
+
+// ============================================================
+// 5. 结果合成与导出 (修改点在此)
+// ============================================================
+
+// [修改点]: 在最后加上 .toFloat()
+// 这将强制所有波段 (SD, Mean, Min) 统一为 Float32 格式，解决 Export 报错
+var apvFeaturesS2 = ndviSD.addBands(ndviMean).addBands(ndviMin).toFloat();
+
+print('Sentinel-2 APV Features (Float32):', apvFeaturesS2);
+
+// 可视化 (保持不变)
+Map.addLayer(apvFeaturesS2, {
+  bands: ['NDVI_sd'], 
+  min: 0, 
+  max: 0.25, 
+  palette: ['white', 'orange', 'red']
+}, 'S2 NDVI SD (Potential Construction)');
+
+Map.addLayer(apvFeaturesS2, {
+  bands: ['NDVI_mean'], 
+  min: 0, 
+  max: 0.8, 
+  palette: ['brown', 'yellow', 'green']
+}, 'S2 NDVI Mean');
+
+Export.image.toAsset({
+  image: apvFeaturesS2,
+  description: 'NDVI_features_hn', // 任务栏显示的名称
+  assetId: 'projects/tiebian/assets/APV_ndviFeatures_S2_30m_hn', 
+  scale: 30,
+  region: roiGeometry,
+  maxPixels: 1e13
+});
