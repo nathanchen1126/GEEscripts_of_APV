@@ -1,0 +1,120 @@
+// ============================================================
+// 1. 基础设置与区域定义
+// ============================================================
+// 假设 roi 已经在 Imports 中定义 (FeatureCollection 或 Geometry)
+var roiGeometry = table.geometry(); 
+Map.centerObject(roiGeometry, 13);
+
+// ============================================================
+// 2. 特征组一：时序特征 (直接读取 Asset)
+// ============================================================
+var temporalFeatures = ee.Image("projects/tiebian/assets/APV_ndviFeatures_S2_30m_hn");
+
+print('已加载时序特征 Asset:', temporalFeatures);
+
+// ============================================================
+// 3. 特征组二：物理材质特征 (2023年基准影像)
+// ============================================================
+
+// SCL 去云函数 (用于处理2023年影像)
+function maskS2clouds(image) {
+  var scl = image.select('SCL');
+  // 保留: 2(Dark), 4(Veg), 5(Bare/Built), 6(Water), 7(Unclassified)
+  var mask = scl.neq(1).and(scl.neq(3)).and(scl.neq(8))
+      .and(scl.neq(9)).and(scl.neq(10)).and(scl.neq(11));
+  return image.updateMask(mask).divide(10000).copyProperties(image, ['system:time_start']);
+}
+
+// 获取2023年的清洁合成影像作为底图
+var baseImage2023 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+    .filterBounds(roiGeometry)
+    .filterDate('2023-01-01', '2023-12-31')
+    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 15))
+    .map(maskS2clouds)
+    .median()
+    .clip(roiGeometry);
+
+// 计算物理指数函数
+function calcPhysicalIndices(img) {
+  // NDPI: 聚合物指数 (区分塑料/光伏板)
+  var ndpi = img.expression(
+    '(B11 - B8) / (B8 + B12)', 
+    {'B11': img.select('B11'), 'B8': img.select('B8'), 'B12': img.select('B12')}
+  ).rename('NDPI');
+
+  // NDBI: 建筑指数
+  var ndbi = img.normalizedDifference(['B11', 'B8']).rename('NDBI');
+
+  // MNDWI: 改进水体指数
+  var mndwi = img.normalizedDifference(['B3', 'B11']).rename('MNDWI');
+
+  // SAVI: 土壤调节植被指数 (L=0.5)
+  var savi = img.expression(
+    '1.5 * (NIR - RED) / (NIR + RED + 0.5)', 
+    {'NIR': img.select('B8'), 'RED': img.select('B4')}
+  ).rename('SAVI');
+
+  return ndpi.addBands(ndbi).addBands(mndwi).addBands(savi);
+}
+
+var physicalFeatures = calcPhysicalIndices(baseImage2023);
+
+// ============================================================
+// 4. 特征组三：GLCM 纹理特征 (基于B8波段)
+// ============================================================
+// 提取 NIR 波段并转为整数
+var nirBand = baseImage2023.select('B8').multiply(10000).toInt32(); 
+
+// 计算纹理 (窗口大小 size:4 对应 9x9 像素)
+var glcm = nirBand.glcmTexture({size: 4}); 
+
+// 选择对光伏阵列敏感的纹理统计量
+var textureFeatures = glcm.select([
+  'B8_asm',      // 均匀性
+  'B8_contrast', // 对比度
+  'B8_corr',     // 相关性
+  'B8_var',      // 方差
+  'B8_idm',      // 逆差矩
+  'B8_savg',     // 和平均
+  'B8_ent'       // 熵
+]);
+
+// ============================================================
+// 5. 特征组四：地形特征
+// ============================================================
+var dem = ee.Image('JAXA/ALOS/AW3D30_V1_1').clip(roiGeometry).select('AVE').rename('elevation');
+var slope = ee.Terrain.slope(dem).rename('slope');
+var terrainFeatures = dem.addBands(slope);
+
+// ============================================================
+// 6. 数据集合并与导出准备
+// ============================================================
+
+// 将所有特征堆叠在一起，并统一转换为 Float32
+var finalDataset = temporalFeatures
+    .addBands(physicalFeatures)
+    .addBands(textureFeatures)
+    .addBands(terrainFeatures)
+    .addBands(baseImage2023.select(['B2', 'B3', 'B4', 'B8'])) // 附带2023年原始波段
+    .toFloat()
+    .clip(roiGeometry);
+
+print('最终用于RF分类的数据集:', finalDataset);
+
+// 可视化检查
+Map.addLayer(finalDataset, {bands:['NDVI_sd'], min:0, max:0.25, palette:['white', 'red']}, 'Feature: NDVI_sd (Asset)');
+Map.addLayer(finalDataset, {bands:['NDPI'], min:-0.5, max:0.5}, 'Feature: NDPI');
+Map.addLayer(finalDataset, {bands:['B8_asm'], min:0, max:100}, 'Feature: Texture ASM');
+
+// ============================================================
+// 7. (可选) 导出最终多波段样本底图
+// ============================================================
+// 如果你想把这个包含所有19个波段的图也存下来，可以运行这个导出
+Export.image.toAsset({
+  image: finalDataset,
+  description: 'APV_Full_Feature_hn_2023',
+  assetId: 'projects/tiebian/assets/APV_allFeatures_S2_30m_hn',
+  scale: 30,
+  region: roiGeometry,
+  maxPixels: 1e13
+});
